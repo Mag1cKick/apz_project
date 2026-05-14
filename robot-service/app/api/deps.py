@@ -1,16 +1,26 @@
-from fastapi import Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
-from app.config import settings
+from fastapi import HTTPException, Request
+import httpx
+from common.consul_client import discover
 
-_bearer = HTTPBearer()
+COOKIE_NAME = "robotops_token"
 
 
-def get_current_user_id(
-    creds: HTTPAuthorizationCredentials = Depends(_bearer),
-) -> str:
+async def get_current_user_id(request: Request) -> str:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=["HS256"])
-        return payload["sub"]
-    except (JWTError, KeyError):
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        auth_url = await discover("auth-service")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{auth_url}/auth/me",
+                cookies={COOKIE_NAME: token},
+                timeout=5,
+            )
+    except (httpx.RequestError, RuntimeError):
+        raise HTTPException(status_code=503, detail="Auth service unavailable")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    return resp.json()["id"]

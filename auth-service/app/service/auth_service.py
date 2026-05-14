@@ -1,13 +1,12 @@
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 import redis.asyncio as aioredis
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 
 from app.config import settings
 from app.models.user import User
-from app.models.schemas import TokenResponse
 from app.repository.user_repository import UserRepository
 
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -45,7 +44,8 @@ class AuthService:
         user = User(username=username, email=email, password_hash=self._hash(password))
         return await self.repo.create(user)
 
-    async def login(self, username: str, password: str) -> TokenResponse:
+    async def login(self, username: str, password: str) -> tuple[str, User]:
+        """Returns (token, user) — token goes into HttpOnly cookie, user returned to client."""
         user = await self.repo.get_by_username(username)
         if not user or not self._verify(password, user.password_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -55,7 +55,7 @@ class AuthService:
             settings.jwt_expire_minutes * 60,
             str(user.id),
         )
-        return TokenResponse(access_token=token)
+        return token, user
 
     async def logout(self, token: str) -> None:
         await self.redis.delete(self._redis_key(token))

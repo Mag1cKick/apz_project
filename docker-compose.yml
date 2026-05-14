@@ -1,21 +1,59 @@
-
 services:
 
   # ─────────────────────────────────────────
-  # API Gateway
+  # Consul — Service Discovery, Registry & Config
+  # ─────────────────────────────────────────
+  consul:
+    image: hashicorp/consul:${CONSUL_VERSION:-1.18}
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    ports:
+      - "8500:8500"
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - robotops-net
+
+  # ─────────────────────────────────────────
+  # Consul KV Seed — writes Hazelcast config
+  # into Consul KV on boot, then exits.
+  # This is the single source of truth for
+  # Hazelcast connection settings.
+  # ─────────────────────────────────────────
+  consul-seed:
+    image: hashicorp/consul:${CONSUL_VERSION:-1.18}
+    restart: "no"
+    depends_on:
+      consul:
+        condition: service_healthy
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+    entrypoint:
+      - sh
+      - -c
+      - |
+        consul kv put config/hazelcast/members      "hazelcast1:5701,hazelcast2:5701,hazelcast3:5701"
+        consul kv put config/hazelcast/cluster-name "robotops-hz"
+        consul kv put config/hazelcast/queue-name   "mission-queue"
+        echo "Consul KV seeded successfully."
+    networks:
+      - robotops-net
+
+  # ─────────────────────────────────────────
+  # API Gateway (nginx + consul-template)
   # ─────────────────────────────────────────
   nginx:
-    image: nginx:alpine
+    build: ./nginx
     ports:
       - "80:80"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend:/usr/share/nginx/html:ro
     depends_on:
-      - auth-service-1
-      - auth-service-2
-      - robot-service
-      - mission-service
+      consul:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - robotops-net
@@ -24,35 +62,41 @@ services:
   # Auth Service  (2 instances — HA + Redis)
   # ─────────────────────────────────────────
   auth-service-1:
-    build: ./auth-service
-    ports:
-      - "8001:8001"
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
     environment:
-      SERVICE_PORT: 8001
-      POSTGRES_URL: postgresql+asyncpg://auth_user:auth_pass@auth-db:5432/auth_db
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-robotops-secret-change-me}
-      JWT_EXPIRE_MINUTES: 60
+      SERVICE_PORT: ${AUTH_SERVICE_PORT}
+      POSTGRES_URL: ${POSTGRES_AUTH_URL}
+      REDIS_URL: ${REDIS_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
     depends_on:
       auth-db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      consul:
         condition: service_healthy
     networks:
       - robotops-net
 
   auth-service-2:
-    build: ./auth-service
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
     environment:
-      SERVICE_PORT: 8001
-      POSTGRES_URL: postgresql+asyncpg://auth_user:auth_pass@auth-db:5432/auth_db
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-robotops-secret-change-me}
-      JWT_EXPIRE_MINUTES: 60
+      SERVICE_PORT: ${AUTH_SERVICE_PORT}
+      POSTGRES_URL: ${POSTGRES_AUTH_URL}
+      REDIS_URL: ${REDIS_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
     depends_on:
       auth-db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      consul:
         condition: service_healthy
     networks:
       - robotops-net
@@ -61,38 +105,47 @@ services:
   # Robot Service  (MongoDB Replica Set)
   # ─────────────────────────────────────────
   robot-service:
-    build: ./robot-service
-    ports:
-      - "8002:8002"
+    build:
+      context: .
+      dockerfile: robot-service/Dockerfile
     environment:
-      SERVICE_PORT: 8002
-      MONGO_URI: mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0
-      MONGO_DB: robot_db
-      JWT_SECRET: ${JWT_SECRET:-robotops-secret-change-me}
+      SERVICE_PORT: ${ROBOT_SERVICE_PORT}
+      MONGO_URI: ${MONGO_URI}
+      MONGO_DB: ${MONGO_DB:-robot_db}
+      JWT_SECRET: ${JWT_SECRET}
     depends_on:
       mongo-init:
         condition: service_completed_successfully
+      consul:
+        condition: service_healthy
     networks:
       - robotops-net
 
   # ─────────────────────────────────────────
-  # Mission Service  (PostgreSQL + Hazelcast Queue)
+  # Mission Service  (PostgreSQL + Hazelcast)
+  # Hazelcast config read from Consul KV
   # ─────────────────────────────────────────
   mission-service:
-    build: ./mission-service
-    ports:
-      - "8003:8003"
+    build:
+      context: .
+      dockerfile: mission-service/Dockerfile
     environment:
-      SERVICE_PORT: 8003
-      POSTGRES_URL: postgresql+asyncpg://mission_user:mission_pass@mission-db:5432/mission_db
-      HAZELCAST_MEMBERS: hazelcast1:5701,hazelcast2:5701,hazelcast3:5701
-      HAZELCAST_CLUSTER_NAME: robotops-hz
-      JWT_SECRET: ${JWT_SECRET:-robotops-secret-change-me}
+      SERVICE_PORT: ${MISSION_SERVICE_PORT}
+      POSTGRES_URL: ${POSTGRES_MISSION_URL}
+      JWT_SECRET: ${JWT_SECRET}
     depends_on:
       mission-db:
         condition: service_healthy
       hazelcast1:
         condition: service_healthy
+      hazelcast2:
+        condition: service_healthy
+      hazelcast3:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      consul-seed:
+        condition: service_completed_successfully
     networks:
       - robotops-net
 
@@ -100,15 +153,15 @@ services:
   # PostgreSQL — Auth
   # ─────────────────────────────────────────
   auth-db:
-    image: postgres:15-alpine
+    image: postgres:${POSTGRES_VERSION:-15-alpine}
     environment:
-      POSTGRES_USER: auth_user
-      POSTGRES_PASSWORD: auth_pass
-      POSTGRES_DB: auth_db
+      POSTGRES_USER: ${POSTGRES_AUTH_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_AUTH_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_AUTH_DB}
     volumes:
       - auth-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U auth_user -d auth_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_AUTH_USER} -d ${POSTGRES_AUTH_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -119,15 +172,15 @@ services:
   # PostgreSQL — Missions
   # ─────────────────────────────────────────
   mission-db:
-    image: postgres:15-alpine
+    image: postgres:${POSTGRES_VERSION:-15-alpine}
     environment:
-      POSTGRES_USER: mission_user
-      POSTGRES_PASSWORD: mission_pass
-      POSTGRES_DB: mission_db
+      POSTGRES_USER: ${POSTGRES_MISSION_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_MISSION_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_MISSION_DB}
     volumes:
       - mission-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mission_user -d mission_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_MISSION_USER} -d ${POSTGRES_MISSION_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -138,49 +191,49 @@ services:
   # MongoDB Replica Set  (3 nodes)
   # ─────────────────────────────────────────
   mongo1:
-    image: mongo:6
-    command: mongod --replSet rs0 --bind_ip_all
+    image: mongo:${MONGO_VERSION:-6}
+    command: mongod --replSet ${MONGO_REPLICASET:-rs0} --bind_ip_all
     volumes:
       - mongo1-data:/data/db
     networks:
       - robotops-net
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok === 1 || quit(1)", "--quiet"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 15
+      start_period: 30s
 
   mongo2:
-    image: mongo:6
-    command: mongod --replSet rs0 --bind_ip_all
+    image: mongo:${MONGO_VERSION:-6}
+    command: mongod --replSet ${MONGO_REPLICASET:-rs0} --bind_ip_all
     volumes:
       - mongo2-data:/data/db
     networks:
       - robotops-net
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok === 1 || quit(1)", "--quiet"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 15
+      start_period: 30s
 
   mongo3:
-    image: mongo:6
-    command: mongod --replSet rs0 --bind_ip_all
+    image: mongo:${MONGO_VERSION:-6}
+    command: mongod --replSet ${MONGO_REPLICASET:-rs0} --bind_ip_all
     volumes:
       - mongo3-data:/data/db
     networks:
       - robotops-net
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok", "--quiet"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok === 1 || quit(1)", "--quiet"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 15
+      start_period: 30s
 
   mongo-init:
-    image: mongo:6
+    image: mongo:${MONGO_VERSION:-6}
     restart: "no"
     depends_on:
       mongo1:
@@ -189,14 +242,32 @@ services:
         condition: service_healthy
       mongo3:
         condition: service_healthy
+    environment:
+      MONGO_HOST_1: ${MONGO_HOST_1:-mongo1}
+      MONGO_HOST_2: ${MONGO_HOST_2:-mongo2}
+      MONGO_HOST_3: ${MONGO_HOST_3:-mongo3}
+      MONGO_PORT: ${MONGO_PORT:-27017}
+      MONGO_REPLICASET: ${MONGO_REPLICASET:-rs0}
     entrypoint:
-      - bash
-      - -c
-      - >
-        mongosh --host mongo1:27017 --eval
-        "rs.status().ok === 1 ? print('already initialized') :
-        rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo1:27017',priority:2},{_id:1,host:'mongo2:27017',priority:1},{_id:2,host:'mongo3:27017',priority:1}]})"
-        || true
+      - mongosh
+      - --host
+      - ${MONGO_HOST_1:-mongo1}:${MONGO_PORT:-27017}
+      - --eval
+      - |
+        var s = rs.status();
+        if (s.ok !== 1) {
+          rs.initiate({
+            _id: '${MONGO_REPLICASET:-rs0}',
+            members: [
+              {_id: 0, host: '${MONGO_HOST_1:-mongo1}:${MONGO_PORT:-27017}', priority: 2},
+              {_id: 1, host: '${MONGO_HOST_2:-mongo2}:${MONGO_PORT:-27017}', priority: 1},
+              {_id: 2, host: '${MONGO_HOST_3:-mongo3}:${MONGO_PORT:-27017}', priority: 1}
+            ]
+          });
+          print('Replica set initiated');
+        } else {
+          print('Replica set already initialized');
+        }
     networks:
       - robotops-net
 
@@ -204,7 +275,7 @@ services:
   # Redis  (JWT store, shared across auth instances)
   # ─────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:${REDIS_VERSION:-7-alpine}
     volumes:
       - redis-data:/data
     healthcheck:
@@ -219,10 +290,12 @@ services:
   # Hazelcast Cluster  (3 nodes — Queue + Map)
   # ─────────────────────────────────────────
   hazelcast1:
-    image: hazelcast/hazelcast:5.3
+    image: hazelcast/hazelcast:${HAZELCAST_VERSION:-5.3}
     environment:
-      HZ_CLUSTERNAME: robotops-hz
+      HZ_CLUSTERNAME: ${HAZELCAST_CLUSTER_NAME:-robotops-hz}
       JDK_JAVA_OPTIONS: "-Dhazelcast.config=/hazelcast.yaml"
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/hazelcast.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5701/hazelcast/health/ready || exit 1"]
       interval: 15s
@@ -233,10 +306,12 @@ services:
       - robotops-net
 
   hazelcast2:
-    image: hazelcast/hazelcast:5.3
+    image: hazelcast/hazelcast:${HAZELCAST_VERSION:-5.3}
     environment:
-      HZ_CLUSTERNAME: robotops-hz
-      JAVA_OPTS: "-Dhazelcast.config=/hazelcast.yaml"
+      HZ_CLUSTERNAME: ${HAZELCAST_CLUSTER_NAME:-robotops-hz}
+      JDK_JAVA_OPTIONS: "-Dhazelcast.config=/hazelcast.yaml"
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/hazelcast.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5701/hazelcast/health/ready || exit 1"]
       interval: 15s
@@ -247,10 +322,12 @@ services:
       - robotops-net
 
   hazelcast3:
-    image: hazelcast/hazelcast:5.3
+    image: hazelcast/hazelcast:${HAZELCAST_VERSION:-5.3}
     environment:
-      HZ_CLUSTERNAME: robotops-hz
-      JAVA_OPTS: "-Dhazelcast.config=/hazelcast.yaml"
+      HZ_CLUSTERNAME: ${HAZELCAST_CLUSTER_NAME:-robotops-hz}
+      JDK_JAVA_OPTIONS: "-Dhazelcast.config=/hazelcast.yaml"
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/hazelcast.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5701/hazelcast/health/ready || exit 1"]
       interval: 15s

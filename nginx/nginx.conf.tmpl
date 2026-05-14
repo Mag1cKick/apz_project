@@ -5,16 +5,21 @@ http {
     default_type application/octet-stream;
 
     upstream auth_upstream {
-        server auth-service-1:8001;
-        server auth-service-2:8001;
+        {{- range service "auth-service" }}
+        server {{ .Address }}:{{ .Port }};
+        {{- end }}
     }
 
     upstream robot_upstream {
-        server robot-service:8002;
+        {{- range service "robot-service" }}
+        server {{ .Address }}:{{ .Port }};
+        {{- end }}
     }
 
     upstream mission_upstream {
-        server mission-service:8003;
+        {{- range service "mission-service" }}
+        server {{ .Address }}:{{ .Port }};
+        {{- end }}
     }
 
     server {
@@ -30,23 +35,24 @@ http {
         # ── API proxy ─────────────────────────────────────────
         location /auth {
             proxy_pass       http://auth_upstream;
-            proxy_set_header Host            $host;
-            proxy_set_header X-Real-IP       $remote_addr;
-            proxy_set_header Authorization   $http_authorization;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header Cookie            $http_cookie;
+            proxy_pass_header Set-Cookie;
         }
 
         location /robots {
             proxy_pass       http://robot_upstream;
-            proxy_set_header Host            $host;
-            proxy_set_header X-Real-IP       $remote_addr;
-            proxy_set_header Authorization   $http_authorization;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header Cookie            $http_cookie;
         }
 
         location /missions {
             proxy_pass       http://mission_upstream;
-            proxy_set_header Host            $host;
-            proxy_set_header X-Real-IP       $remote_addr;
-            proxy_set_header Authorization   $http_authorization;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header Cookie            $http_cookie;
         }
     }
 }
